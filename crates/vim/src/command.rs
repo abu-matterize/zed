@@ -49,7 +49,7 @@ use crate::{
     },
     object::Object,
     rewrap::Rewrap,
-    state::{Mark, Mode},
+    state::{Mark, Mode, VimGlobals},
     visual::VisualDeleteLine,
 };
 
@@ -817,11 +817,13 @@ pub fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
         cx.spawn_in(window, async move |vim, cx| {
             task.await;
             vim.update_in(cx, |vim, window, cx| {
-                if matches!(vim.mode, Mode::Insert | Mode::Replace) {
-                    vim.normal_before(&Default::default(), window, cx);
-                } else {
-                    vim.switch_mode(Mode::Normal, true, window, cx);
-                }
+                VimGlobals::with_input(vim.input.clone(), cx, |cx| {
+                    if matches!(vim.mode, Mode::Insert | Mode::Replace) {
+                        vim.normal_before(&Default::default(), window, cx);
+                    } else {
+                        vim.switch_mode(Mode::Normal, true, window, cx);
+                    }
+                });
                 if had_override || had_range {
                     vim.update_editor(cx, |_, editor, cx| {
                         editor.change_selections(SelectionEffects::default(), window, cx, |s| {
@@ -2347,48 +2349,61 @@ impl Vim {
         ret
     }
 
-    pub fn shell_command_motion(
+    pub(crate) fn plan_shell_command_motion(
         &mut self,
         motion: Motion,
         times: Option<usize>,
         forced_motion: bool,
         window: &mut Window,
         cx: &mut Context<Vim>,
-    ) {
-        self.stop_recording(cx);
-        let Some(workspace) = self.workspace(window, cx) else {
-            return;
-        };
-        let command = self.update_editor(cx, |_, editor, cx| {
-            let snapshot = editor.snapshot(window, cx);
-            let start = editor
-                .selections
-                .newest_display(&editor.display_snapshot(cx));
-            let text_layout_details = editor.text_layout_details(window, cx);
-            let (mut range, _) = motion
-                .range(&snapshot, start, times, &text_layout_details, forced_motion)
-                .unwrap_or((start.range(), MotionKind::Exclusive));
-            if range.start != start.start {
-                editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-                    s.select_ranges([
-                        range.start.to_point(&snapshot)..range.start.to_point(&snapshot)
-                    ]);
-                })
+    ) -> Result<crate::GeometryCommit, editor::display_map::PendingRowGeometry> {
+        let planned = self
+            .update_editor(
+                cx,
+                |_, editor, cx| -> Result<_, editor::display_map::PendingRowGeometry> {
+                    let snapshot = editor.snapshot(window, cx);
+                    let start = editor.selections.newest_display(&snapshot);
+                    let details = editor.text_layout_details(window, cx);
+                    let (mut range, _) = motion
+                        .range(&snapshot, start, times, &details, forced_motion)?
+                        .unwrap_or((start.range(), MotionKind::Exclusive));
+                    let cursor =
+                        (range.start != start.start).then(|| range.start.to_point(&snapshot));
+                    if range.end.row() > range.start.row() && range.end.column() != 0 {
+                        *range.end.row_mut() -= 1;
+                    }
+                    let command = if range.end.row() == range.start.row() {
+                        String::from(".!")
+                    } else {
+                        format!(".,.+{}!", (range.end.row() - range.start.row()).0)
+                    };
+                    Ok((cursor, command))
+                },
+            )
+            .transpose()?;
+        Ok(Box::new(move |vim, window, cx| {
+            vim.stop_recording(cx);
+            let Some(workspace) = vim.workspace(window, cx) else {
+                return;
+            };
+            if let Some((cursor, command)) = planned {
+                if let Some(cursor) = cursor {
+                    vim.update_editor(cx, |_, editor, cx| {
+                        editor.change_selections(
+                            SelectionEffects::no_scroll(),
+                            window,
+                            cx,
+                            |selections| {
+                                selections.select_ranges([cursor..cursor]);
+                            },
+                        );
+                    });
+                }
+                workspace.update(cx, |workspace, cx| {
+                    command_palette::CommandPalette::toggle(workspace, &command, window, cx);
+                });
             }
-            if range.end.row() > range.start.row() && range.end.column() != 0 {
-                *range.end.row_mut() -= 1
-            }
-            if range.end.row() == range.start.row() {
-                ".!".to_string()
-            } else {
-                format!(".,.+{}!", (range.end.row() - range.start.row()).0)
-            }
-        });
-        if let Some(command) = command {
-            workspace.update(cx, |workspace, cx| {
-                command_palette::CommandPalette::toggle(workspace, &command, window, cx);
-            });
-        }
+        }))
     }
 
     pub fn shell_command_object(

@@ -1,4 +1,5 @@
 use super::*;
+use crate::deferred_input::CapturedInput;
 use util::rel_path::RelPath;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -56,7 +57,91 @@ impl ClipboardSelection {
     }
 }
 
+#[derive(Default)]
+pub(super) struct DeferredClipboard {
+    writes: Rc<RefCell<Option<Rc<ClipboardItem>>>>,
+}
+
+#[derive(Clone)]
+pub(super) struct CapturedClipboardAction {
+    writes: Rc<RefCell<Option<Rc<ClipboardItem>>>>,
+    preceding_write: Option<Rc<ClipboardItem>>,
+    item: Option<Rc<ClipboardItem>>,
+}
+
+impl DeferredClipboard {
+    fn capture(
+        &self,
+        captured: Option<&CapturedClipboardAction>,
+        read: impl FnOnce() -> Option<ClipboardItem>,
+    ) -> CapturedClipboardAction {
+        captured
+            .filter(|captured| Rc::ptr_eq(&captured.writes, &self.writes))
+            .cloned()
+            .unwrap_or_else(|| CapturedClipboardAction {
+                writes: self.writes.clone(),
+                preceding_write: self.writes.borrow().clone(),
+                item: read().map(Rc::new),
+            })
+    }
+
+    fn read(
+        &self,
+        captured: Option<&CapturedClipboardAction>,
+        read: impl FnOnce() -> Option<ClipboardItem>,
+    ) -> Option<ClipboardItem> {
+        let Some(captured) = captured.filter(|captured| Rc::ptr_eq(&captured.writes, &self.writes))
+        else {
+            return read();
+        };
+        if let Some(last_write) = self.writes.borrow().as_ref()
+            && !captured
+                .preceding_write
+                .as_ref()
+                .is_some_and(|preceding_write| Rc::ptr_eq(preceding_write, last_write))
+        {
+            Some(last_write.as_ref().clone())
+        } else {
+            captured.item.as_deref().cloned()
+        }
+    }
+
+    fn record_write(&mut self, item: &ClipboardItem) {
+        *self.writes.borrow_mut() = Some(Rc::new(item.clone()));
+    }
+}
+
 impl Editor {
+    pub fn read_from_clipboard(&self, cx: &App) -> Option<ClipboardItem> {
+        self.deferred_input.clipboard.read(
+            CapturedInput::current(cx).and_then(|input| input.clipboard.as_ref()),
+            || cx.read_from_clipboard(),
+        )
+    }
+
+    pub fn write_to_clipboard(&mut self, item: ClipboardItem, cx: &mut App) {
+        if self.input_is_replaying() {
+            self.deferred_input.clipboard.record_write(&item);
+        }
+        cx.write_to_clipboard(item);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    pub fn read_from_primary(&self, cx: &App) -> Option<ClipboardItem> {
+        self.deferred_input.primary.read(
+            CapturedInput::current(cx).and_then(|input| input.primary.as_ref()),
+            || cx.read_from_primary(),
+        )
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    pub fn write_to_primary(&mut self, item: ClipboardItem, cx: &mut App) {
+        if self.input_is_replaying() {
+            self.deferred_input.primary.record_write(&item);
+        }
+        cx.write_to_primary(item);
+    }
+
     pub fn do_paste(
         &mut self,
         text: &String,
@@ -65,6 +150,17 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.input_is_deferred() {
+            let text = text.clone();
+            self.defer_input(
+                move |editor, window, cx| {
+                    editor.do_paste(&text, clipboard_selections, handle_entire_lines, window, cx);
+                },
+                window,
+                cx,
+            );
+            return;
+        }
         if self.read_only(cx) {
             return;
         }
@@ -249,8 +345,11 @@ impl Editor {
         });
     }
 
-    pub fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(item) = cx.read_from_clipboard() {
+    pub fn paste(&mut self, action: &Paste, window: &mut Window, cx: &mut Context<Self>) {
+        if self.defer_action(action, Self::paste, window, cx) {
+            return;
+        }
+        if let Some(item) = self.read_from_clipboard(cx) {
             self.paste_item(&item, window, cx);
         }
     }
@@ -261,6 +360,15 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.input_is_deferred() {
+            let item = item.clone();
+            self.defer_input(
+                move |editor, window, cx| editor.paste_item(&item, window, cx),
+                window,
+                cx,
+            );
+            return;
+        }
         if self.read_only(cx) {
             return;
         }
@@ -343,6 +451,15 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.input_is_deferred() {
+            let filename = filename.to_owned();
+            self.defer_input(
+                move |editor, window, cx| editor.insert_image_snippet(&filename, window, cx),
+                window,
+                cx,
+            );
+            return;
+        }
         let Some(snippet) = Snippet::parse(&format!("![$1]({filename})$0")).log_err() else {
             return;
         };
@@ -355,6 +472,32 @@ impl Editor {
             .collect();
         self.insert_snippet(&insertion_ranges, snippet, window, cx)
             .log_err();
+    }
+
+    pub(super) fn capture_clipboard(&self, cx: &App) -> CapturedClipboardAction {
+        self.deferred_input.clipboard.capture(
+            CapturedInput::current(cx).and_then(|input| input.clipboard.as_ref()),
+            || cx.read_from_clipboard(),
+        )
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    pub(super) fn capture_primary(&self, cx: &App) -> CapturedClipboardAction {
+        self.deferred_input.primary.capture(
+            CapturedInput::current(cx).and_then(|input| input.primary.as_ref()),
+            || cx.read_from_primary(),
+        )
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    pub(super) fn read_captured_primary(
+        &self,
+        captured: &CapturedClipboardAction,
+        cx: &App,
+    ) -> Option<ClipboardItem> {
+        self.deferred_input
+            .primary
+            .read(Some(captured), || cx.read_from_primary())
     }
 
     pub(super) fn cut_common(
@@ -415,20 +558,26 @@ impl Editor {
         ClipboardItem::new_string_with_json_metadata(text, clipboard_selections)
     }
 
-    pub(super) fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn cut(&mut self, action: &Cut, window: &mut Window, cx: &mut Context<Self>) {
+        if self.defer_action(action, Self::cut, window, cx) {
+            return;
+        }
         if self.read_only(cx) {
             return;
         }
         let item = self.cut_common(true, window, cx);
-        cx.write_to_clipboard(item);
+        self.write_to_clipboard(item, cx);
     }
 
     pub(super) fn kill_ring_cut(
         &mut self,
-        _: &KillRingCut,
+        action: &KillRingCut,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.defer_action(action, Self::kill_ring_cut, window, cx) {
+            return;
+        }
         if self.read_only(cx) {
             return;
         }
@@ -513,10 +662,13 @@ impl Editor {
 
     pub(super) fn kill_ring_yank(
         &mut self,
-        _: &KillRingYank,
+        action: &KillRingYank,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.defer_action(action, Self::kill_ring_yank, window, cx) {
+            return;
+        }
         if !cx.has_global::<KillRing>() {
             return;
         }
@@ -531,23 +683,32 @@ impl Editor {
 
     pub(super) fn copy_and_trim(
         &mut self,
-        _: &CopyAndTrim,
-        _: &mut Window,
+        action: &CopyAndTrim,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.defer_action(action, Self::copy_and_trim, window, cx) {
+            return;
+        }
         self.do_copy(true, cx);
     }
 
-    pub(super) fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn copy(&mut self, action: &Copy, window: &mut Window, cx: &mut Context<Self>) {
+        if self.defer_action(action, Self::copy, window, cx) {
+            return;
+        }
         self.do_copy(false, cx);
     }
 
     pub(super) fn diff_clipboard_with_selection(
         &mut self,
-        _: &DiffClipboardWithSelection,
+        action: &DiffClipboardWithSelection,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.defer_action(action, Self::diff_clipboard_with_selection, window, cx) {
+            return;
+        }
         let selections = self
             .selections
             .all::<MultiBufferOffset>(&self.display_snapshot(cx));
@@ -557,7 +718,7 @@ impl Editor {
             return;
         };
 
-        let clipboard_text = cx.read_from_clipboard().and_then(|item| {
+        let clipboard_text = self.read_from_clipboard(cx).and_then(|item| {
             item.entries().iter().find_map(|entry| match entry {
                 ClipboardEntry::String(text) => Some(text.text().to_string()),
                 _ => None,
@@ -578,7 +739,7 @@ impl Editor {
         );
     }
 
-    fn do_copy(&self, strip_leading_indents: bool, cx: &mut Context<Self>) {
+    fn do_copy(&mut self, strip_leading_indents: bool, cx: &mut Context<Self>) {
         let selections = self.selections.all::<Point>(&self.display_snapshot(cx));
         let buffer = self.buffer.read(cx).read(cx);
         let mut text = String::new();
@@ -673,10 +834,11 @@ impl Editor {
             ));
         }
 
-        cx.write_to_clipboard(ClipboardItem::new_string_with_json_metadata(
-            text,
-            clipboard_selections,
-        ));
+        drop(buffer);
+        self.write_to_clipboard(
+            ClipboardItem::new_string_with_json_metadata(text, clipboard_selections),
+            cx,
+        );
     }
 }
 
@@ -760,4 +922,379 @@ fn is_standalone_url(text: &str) -> bool {
         .links(text)
         .next()
         .is_some_and(|link| link.start() == 0 && link.end() == text.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{editor_tests::init_test, test::editor_test_context::EditorTestContext};
+    use gpui::{KeyBinding, Keystroke, TestAppContext};
+    use language::language_settings::SoftWrap;
+
+    #[test]
+    fn test_deferred_clipboard_channels_have_independent_writes() {
+        let mut clipboard = DeferredClipboard::default();
+        let mut primary = DeferredClipboard::default();
+        let first = ClipboardItem::new_string(String::from("A"));
+        let second = ClipboardItem::new_string(String::from("B"));
+        let third = ClipboardItem::new_string(String::from("C"));
+        let external = ClipboardItem::new_string(String::from("external"));
+        let captured_clipboard = clipboard.capture(None, || None);
+        let captured_primary = primary.capture(None, || Some(first.clone()));
+        assert_eq!(
+            clipboard.read(Some(&captured_clipboard), || Some(external.clone())),
+            None
+        );
+        clipboard.record_write(&second);
+        assert_eq!(
+            primary.read(Some(&captured_primary), || Some(external.clone())),
+            Some(first)
+        );
+        primary.record_write(&third);
+        assert_eq!(
+            primary.read(Some(&captured_primary), || Some(external.clone())),
+            Some(third.clone())
+        );
+        assert_eq!(
+            clipboard.read(Some(&captured_clipboard), || Some(external.clone())),
+            Some(second)
+        );
+        let later = primary.capture(None, || Some(external.clone()));
+        let retried = primary.capture(Some(&later), || {
+            panic!("retry reread the primary selection")
+        });
+        assert!(Rc::ptr_eq(
+            later.item.as_ref().expect("captured item"),
+            retried.item.as_ref().expect("retried item"),
+        ));
+        assert!(Rc::ptr_eq(
+            later.preceding_write.as_ref().expect("preceding write"),
+            retried
+                .preceding_write
+                .as_ref()
+                .expect("retried preceding write"),
+        ));
+        assert_eq!(
+            primary.read(Some(&retried), || None),
+            Some(external.clone())
+        );
+        for metadata in [None, Some("first"), Some("second"), Some("second")] {
+            let captured = primary.capture(None, || Some(external.clone()));
+            let written = match metadata {
+                Some(metadata) => ClipboardItem::new_string_with_metadata(
+                    String::from("C"),
+                    String::from(metadata),
+                ),
+                None => third.clone(),
+            };
+            primary.record_write(&written);
+            assert_eq!(
+                primary.read(Some(&captured), || None),
+                Some(written.clone())
+            );
+            assert_eq!(primary.read(Some(&retried), || None), Some(written));
+        }
+        assert_eq!(
+            primary.read(Some(&captured_clipboard), || Some(external.clone())),
+            Some(external.clone())
+        );
+        primary = DeferredClipboard::default();
+        assert_eq!(
+            primary.read(Some(&retried), || Some(external.clone())),
+            Some(external)
+        );
+    }
+
+    #[test]
+    fn test_deferred_primary_consumption_precedes_selection_write() {
+        for prior_write in [false, true] {
+            let mut primary = DeferredClipboard::default();
+            let captured = primary.capture(None, || {
+                Some(ClipboardItem::new_string(String::from("arrival")))
+            });
+            if prior_write {
+                primary.record_write(&ClipboardItem::new_string(String::from("queued")));
+            }
+            let consumed = primary.read(Some(&captured), || panic!("late primary read"));
+            primary.record_write(&ClipboardItem::new_string(String::from("release")));
+            assert_eq!(
+                consumed.and_then(|item| item.text()).as_deref(),
+                Some(if prior_write { "queued" } else { "arrival" })
+            );
+            assert_eq!(
+                primary
+                    .read(Some(&captured), || panic!("late primary read"))
+                    .and_then(|item| item.text())
+                    .as_deref(),
+                Some("release")
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_deferred_clipboard_keystroke_factory_is_lazy(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.update_editor(|editor, window, cx| {
+            assert!(!editor.defer_keystroke_input(
+                |_, _| panic!("ready input constructed a keystroke replay"),
+                window,
+                cx,
+            ));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_deferred_clipboard_fallback_captures_payload(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        for already_pending in [false, true] {
+            let mut cx = EditorTestContext::new(cx).await;
+            cx.update(|window, cx| {
+                cx.bind_keys([
+                    KeyBinding::new("ctrl-v", Paste, Some("Editor")),
+                    KeyBinding::new("ctrl-v", MoveUp, Some("Editor")),
+                ]);
+                window.draw(cx).clear(cx);
+            });
+            cx.background_executor.set_block_on_ticks(0..=0);
+            let editor = cx.editor.clone();
+            let text = "x".repeat(2_000);
+            let completion = cx.update(|window, cx| {
+                editor.update(cx, |editor, cx| {
+                    editor.set_soft_wrap_mode(SoftWrap::None, cx);
+                    editor.set_text(text.clone(), window, cx);
+                    editor.change_selections(
+                        SelectionEffects::no_scroll(),
+                        window,
+                        cx,
+                        |selections| {
+                            selections.select_ranges([Point::zero()..Point::zero()]);
+                        },
+                    );
+                    assert!(!editor.input_is_deferred());
+                    if already_pending {
+                        editor.move_up(&MoveUp, window, cx);
+                        assert!(editor.input_is_deferred());
+                    }
+                });
+                cx.write_to_clipboard(ClipboardItem::new_string(String::from("A")));
+                window.dispatch_keystroke(Keystroke::parse("ctrl-v").expect("fallback key"), cx);
+                cx.write_to_clipboard(ClipboardItem::new_string(String::from("B")));
+                editor.update(cx, |editor, cx| {
+                    assert!(editor.input_is_deferred());
+                    assert_eq!(editor.text(cx), text);
+                    editor.input_completion(cx)
+                })
+            });
+            cx.background_executor.set_block_on_ticks(0..=50);
+            completion.await.expect("clipboard fallback completed");
+            cx.assert_editor_state(&format!("Aˇ{text}"));
+        }
+    }
+
+    #[gpui::test]
+    async fn test_deferred_clipboard_captures_each_paste(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        for ingress in [
+            PasteIngress::Direct,
+            PasteIngress::Action,
+            PasteIngress::RegisteredAction,
+            PasteIngress::RegisteredKeyboard,
+        ] {
+            let (mut cx, _subscription) = clipboard_test_context(ingress, cx).await;
+            let editor = cx.editor.clone();
+            let completion = cx.update(|window, cx| {
+                start_deferred_clipboard_input(&editor, window, cx);
+                for text in ["A", "B"] {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text.to_owned()));
+                    dispatch_paste(ingress, &editor, window, cx);
+                }
+                cx.write_to_clipboard(ClipboardItem::new_string(String::from("C")));
+                editor.update(cx, |editor, cx| editor.input_completion(cx))
+            });
+            completion.await.expect("clipboard input completed");
+            cx.assert_editor_state(&format!("ab\nxABˇ{}\ncd", "x".repeat(1_999)));
+        }
+    }
+
+    #[gpui::test]
+    async fn test_deferred_clipboard_replayed_writes_are_dependencies(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        for ingress in [
+            PasteIngress::Direct,
+            PasteIngress::Action,
+            PasteIngress::RegisteredAction,
+            PasteIngress::RegisteredKeyboard,
+        ] {
+            let (mut cx, _subscription) = clipboard_test_context(ingress, cx).await;
+            let editor = cx.editor.clone();
+            let completion = cx.update(|window, cx| {
+                start_deferred_clipboard_input(&editor, window, cx);
+                cx.write_to_clipboard(ClipboardItem::new_string(format!(
+                    "{}\n",
+                    "x".repeat(2_000)
+                )));
+                editor.update(cx, |editor, cx| {
+                    editor.cut(&Cut, window, cx);
+                    editor.move_right(&MoveRight, window, cx);
+                    assert!(editor.defer_input(
+                        |_, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(String::from(
+                                "external",
+                            )));
+                        },
+                        window,
+                        cx,
+                    ));
+                });
+                dispatch_paste(ingress, &editor, window, cx);
+                editor.update(cx, |editor, cx| editor.copy(&Copy, window, cx));
+                dispatch_paste(ingress, &editor, window, cx);
+                cx.write_to_clipboard(ClipboardItem::new_string(String::from("B")));
+                dispatch_paste(ingress, &editor, window, cx);
+                editor.update(cx, |editor, cx| {
+                    editor.cut_to_end_of_line(
+                        &CutToEndOfLine {
+                            stop_at_newlines: true,
+                        },
+                        window,
+                        cx,
+                    );
+                });
+                dispatch_paste(ingress, &editor, window, cx);
+                cx.write_to_clipboard(ClipboardItem::new_string(String::from("C")));
+                editor.update(cx, |editor, cx| editor.input_completion(cx))
+            });
+            completion.await.expect("clipboard dependencies completed");
+            cx.assert_editor_state(&format!("ab\n{}\ncd\ncd\ncdˇ", "x".repeat(2_000)));
+            cx.update_editor(|editor, window, cx| {
+                assert_eq!(
+                    cx.read_from_clipboard().and_then(|item| item.text()),
+                    Some(String::from("d"))
+                );
+                cx.write_to_clipboard(ClipboardItem::new_string(String::from("D")));
+                editor.paste(&Paste, window, cx);
+            });
+            cx.assert_editor_state(&format!("ab\n{}\ncd\ncd\ncdDˇ", "x".repeat(2_000)));
+        }
+    }
+
+    #[gpui::test]
+    async fn test_deferred_clipboard_captures_empty_clipboard(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        let (mut cx, _subscription) =
+            clipboard_test_context(PasteIngress::RegisteredKeyboard, cx).await;
+        let editor = cx.editor.clone();
+        let completion = cx.update(|window, cx| {
+            start_deferred_clipboard_input(&editor, window, cx);
+            assert_eq!(cx.read_from_clipboard(), None);
+            dispatch_paste(PasteIngress::RegisteredKeyboard, &editor, window, cx);
+            cx.write_to_clipboard(ClipboardItem::new_string(String::from("late")));
+            editor.update(cx, |editor, cx| editor.input_completion(cx))
+        });
+        completion.await.expect("empty clipboard input completed");
+        cx.assert_editor_state(&format!("ab\nxˇ{}\ncd", "x".repeat(1_999)));
+    }
+
+    #[gpui::test]
+    async fn test_deferred_clipboard_capture_after_replayed_write(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        let (mut cx, _subscription) = clipboard_test_context(PasteIngress::Direct, cx).await;
+        let editor = cx.editor.clone();
+        let completion = cx.update(|window, cx| {
+            start_deferred_clipboard_input(&editor, window, cx);
+            editor.update(cx, |editor, cx| {
+                editor.cut(&Cut, window, cx);
+                assert!(editor.defer_input(
+                    |editor, window, cx| {
+                        editor.buffer.update(cx, |buffer, cx| {
+                            let end = buffer.len(cx);
+                            buffer.edit([(end..end, format!("\n{}", "y".repeat(2_000)))], None, cx);
+                        });
+                        editor.move_down(&MoveDown, window, cx);
+                        assert!(editor.input_is_deferred());
+                        cx.write_to_clipboard(ClipboardItem::new_string(String::from("A")));
+                        editor.paste(&Paste, window, cx);
+                        cx.write_to_clipboard(ClipboardItem::new_string(String::from("B")));
+                    },
+                    window,
+                    cx,
+                ));
+                editor.input_completion(cx)
+            })
+        });
+        completion.await.expect("nested clipboard input completed");
+        cx.assert_editor_state(&format!("ab\ncd\nAˇ{}", "y".repeat(2_000)));
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum PasteIngress {
+        Direct,
+        Action,
+        RegisteredAction,
+        RegisteredKeyboard,
+    }
+
+    async fn clipboard_test_context(
+        ingress: PasteIngress,
+        cx: &mut TestAppContext,
+    ) -> (EditorTestContext, Option<Subscription>) {
+        let mut cx = EditorTestContext::new(cx).await;
+        let subscription = if ingress == PasteIngress::RegisteredAction
+            || ingress == PasteIngress::RegisteredKeyboard
+        {
+            Some(cx.update_editor(|editor, _, cx| {
+                let handle = cx.weak_entity();
+                let subscription = editor.register_action(move |action: &Paste, window, cx| {
+                    handle
+                        .update(cx, |editor, cx| editor.paste(action, window, cx))
+                        .expect("registered editor is alive");
+                });
+                cx.notify();
+                subscription
+            }))
+        } else {
+            None
+        };
+        cx.update(|window, cx| {
+            cx.bind_keys([KeyBinding::new("ctrl-v", Paste, Some("Editor"))]);
+            window.draw(cx).clear(cx);
+        });
+        (cx, subscription)
+    }
+
+    fn start_deferred_clipboard_input(editor: &Entity<Editor>, window: &mut Window, cx: &mut App) {
+        editor.update(cx, |editor, cx| {
+            editor.set_soft_wrap_mode(SoftWrap::None, cx);
+            editor.set_text(format!("ab\n{}\ncd", "x".repeat(2_000)), window, cx);
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                selections.select_ranges([Point::new(0, 1)..Point::new(0, 1)]);
+            });
+            editor.move_down(&MoveDown, window, cx);
+            assert!(editor.input_is_deferred());
+        });
+    }
+
+    fn dispatch_paste(
+        ingress: PasteIngress,
+        editor: &Entity<Editor>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        match ingress {
+            PasteIngress::Direct => {
+                editor.update(cx, |editor, cx| editor.paste(&Paste, window, cx));
+            }
+            PasteIngress::Action | PasteIngress::RegisteredAction => {
+                editor
+                    .read(cx)
+                    .focus_handle
+                    .clone()
+                    .dispatch_action(&Paste, window, cx);
+            }
+            PasteIngress::RegisteredKeyboard => {
+                window.dispatch_keystroke(Keystroke::parse("ctrl-v").expect("paste keystroke"), cx);
+            }
+        }
+    }
 }

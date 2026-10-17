@@ -8,6 +8,7 @@ use collections::HashMap;
 use command_palette::CommandPalette;
 use editor::{
     AnchorRangeExt, DisplayPoint, Editor, EditorMode, MultiBuffer, MultiBufferOffset,
+    SelectionEffects,
     actions::{DeleteLine, WrapSelectionsInTag},
     code_context_menus::CodeContextMenu,
     display_map::DisplayRow,
@@ -16,12 +17,15 @@ use editor::{
 use futures::StreamExt;
 #[cfg(target_os = "windows")]
 use gpui::AppContext as _;
-use gpui::{KeyBinding, Modifiers, MouseButton, TestAppContext, px};
+use gpui::{
+    ClipboardItem, Context, Focusable, KeyBinding, Keystroke, Modifiers, MouseButton,
+    TestAppContext, Window, px,
+};
 use itertools::Itertools;
 use language::{CursorShape, Language, LanguageConfig, Point};
 pub use neovim_backed_test_context::*;
 use settings::{CommandAliasTarget, SettingsStore};
-use ui::Pixels;
+use ui::{Pixels, SharedString};
 use util::{path, test::marked_text_ranges};
 pub use vim_test_context::*;
 
@@ -36,8 +40,11 @@ use workspace::notifications::{NotificationId, simple_message_notification::Mess
 use workspace::{DeploySearch, MultiWorkspace};
 
 use crate::{
-    PushSneak, PushSneakBackward, SwitchToNormalMode, VimAddon, insert::NormalBefore, motion,
-    state::Mode,
+    PushSneak, PushSneakBackward, SwitchToNormalMode, UseSystemClipboard, Vim, VimAddon,
+    insert::NormalBefore,
+    motion,
+    normal::paste::Paste as VimPaste,
+    state::{Mode, Register},
 };
 
 use util_macros::perf;
@@ -48,6 +55,243 @@ async fn test_initially_disabled(cx: &mut gpui::TestAppContext) {
     let mut cx = VimTestContext::new(cx, false).await;
     cx.simulate_keystrokes("h j k l");
     cx.assert_editor_state("hjklˇ");
+}
+
+#[gpui::test]
+async fn test_mode_change_preserves_authoritative_horizontal_positions(cx: &mut TestAppContext) {
+    let mut cx = VimTestContext::new(cx, true).await;
+    cx.update_editor(|editor, _, cx| editor.set_soft_wrap_mode(settings::SoftWrap::None, cx));
+    let source = format!(
+        "{}{}{}",
+        "x".repeat(100_000),
+        "😀".repeat(8),
+        "x".repeat(100_000)
+    );
+    let destination = "x".repeat(200_050);
+
+    for mode in [Mode::Insert, Mode::Visual] {
+        cx.set_state(&format!("ˇ\nxx\n{destination}"), Mode::Normal);
+        cx.background_executor.set_block_on_ticks(0..=0);
+        let vim = cx.update_editor(|editor, window, cx| {
+            editor.buffer().update(cx, |buffer, cx| {
+                let start = Point::new(0, 0);
+                buffer.edit([(start..start, source.as_str())], None, cx);
+            });
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                let point = Point::new(0, 200_030);
+                selections.select_ranges([point..point]);
+            });
+            editor.addon::<VimAddon>().cloned().expect("vim")
+        });
+        cx.update(|window, cx| {
+            vim.entity.update(cx, |vim, cx| {
+                vim.motion(
+                    motion::Motion::Down {
+                        display_lines: false,
+                    },
+                    window,
+                    cx,
+                );
+                let assert_motion = |vim: &mut Vim, _: &mut Window, cx: &mut Context<Vim>| {
+                    assert_eq!(vim.mode, Mode::Normal);
+                    vim.update_editor(cx, |_, editor, cx| {
+                        let snapshot = editor.display_snapshot(cx);
+                        assert_eq!(
+                            editor.selections.newest::<Point>(&snapshot).head(),
+                            Point::new(1, 1)
+                        );
+                    });
+                };
+                if !vim.defer_input(assert_motion, cx) {
+                    assert_motion(vim, window, cx);
+                }
+                vim.switch_mode(mode, false, window, cx);
+            });
+        });
+        let completion = cx.update_editor(|editor, _, cx| editor.input_completion(cx));
+        cx.background_executor.set_block_on_ticks(0..=50);
+        completion.await.expect("deferred motion and mode change");
+        let frozen = cx.update_editor(|editor, _, cx| {
+            assert_eq!(vim.entity.read(cx).mode, mode);
+            let snapshot = editor.display_snapshot(cx);
+            editor.selections.newest::<Point>(&snapshot).range()
+        });
+        let expected_end = if mode == Mode::Visual { 2 } else { 1 };
+        assert_eq!(frozen, Point::new(1, 1)..Point::new(1, expected_end));
+        cx.run_until_parked();
+        cx.update_editor(|editor, _, cx| {
+            let snapshot = editor.display_snapshot(cx);
+            assert_eq!(editor.selections.newest::<Point>(&snapshot).range(), frozen);
+        });
+        cx.update(|window, cx| {
+            vim.entity.update(cx, |vim, cx| {
+                vim.switch_mode(Mode::Normal, false, window, cx);
+                vim.motion(
+                    motion::Motion::Down {
+                        display_lines: false,
+                    },
+                    window,
+                    cx,
+                );
+            });
+        });
+        cx.update_editor(|editor, _, cx| editor.input_completion(cx))
+            .await
+            .expect("deferred mode change and motion");
+        cx.run_until_parked();
+        cx.update_editor(|editor, _, cx| {
+            let snapshot = editor.display_snapshot(cx);
+            assert_eq!(
+                editor.selections.newest::<Point>(&snapshot).head(),
+                Point::new(2, 200_014)
+            );
+        });
+    }
+}
+
+#[gpui::test]
+async fn test_deferred_clipboard_raw_keystrokes_capture_each_paste(cx: &mut TestAppContext) {
+    let mut cx = VimTestContext::new(cx, true).await;
+    cx.update(|_, cx| {
+        cx.bind_keys([KeyBinding::new(
+            "ctrl-v",
+            editor::actions::Paste,
+            Some("Editor"),
+        )]);
+    });
+    for (keys, clipboard_setting, paste_column) in [
+        ("ctrl-v", UseSystemClipboard::Always, 1),
+        ("p", UseSystemClipboard::Always, 2),
+        ("\" + p", UseSystemClipboard::Never, 2),
+        ("p", UseSystemClipboard::OnYank, 2),
+    ] {
+        cx.update_global(|store: &mut SettingsStore, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.vim.get_or_insert_default().use_system_clipboard = Some(clipboard_setting);
+            });
+        });
+        cx.set_state("aˇb\n", Mode::Normal);
+        cx.background_executor.set_block_on_ticks(0..=0);
+        let editor = cx.update_editor(|_, _, cx| cx.entity());
+        let completion = cx.update(|window, cx| {
+            Vim::update_globals(cx, |globals, _| {
+                globals.last_yank = Some(SharedString::from("C"));
+                globals
+                    .registers
+                    .insert('"', Register::from(String::from("internal")));
+            });
+            editor.update(cx, |editor, cx| {
+                editor.set_soft_wrap_mode(settings::SoftWrap::None, cx);
+                editor.set_text(format!("ab\n{}", "x".repeat(2_000)), window, cx);
+                editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                    selections.select_ranges([Point::new(0, 1)..Point::new(0, 1)]);
+                });
+            });
+            window.dispatch_keystroke(Keystroke::parse("j").expect("move keystroke"), cx);
+            editor.update(cx, |editor, cx| {
+                assert!(editor.defer_external_input(|_, _| {}, cx));
+            });
+            for text in ["A", "B"] {
+                cx.write_to_clipboard(ClipboardItem::new_string(text.to_owned()));
+                for key in keys.split_whitespace() {
+                    window.dispatch_keystroke(Keystroke::parse(key).expect("paste keystroke"), cx);
+                }
+            }
+            cx.write_to_clipboard(ClipboardItem::new_string(String::from("C")));
+            editor.update(cx, |editor, cx| editor.input_completion(cx))
+        });
+        cx.background_executor.set_block_on_ticks(0..=50);
+        completion.await.expect("raw clipboard input completed");
+        assert_eq!(
+            cx.buffer_text(),
+            format!(
+                "ab\n{}AB{}",
+                "x".repeat(paste_column),
+                "x".repeat(2_000 - paste_column)
+            ),
+            "{keys}"
+        );
+    }
+}
+
+#[gpui::test]
+async fn test_deferred_clipboard_vim_action_captures_payload(cx: &mut TestAppContext) {
+    let mut cx = VimTestContext::new(cx, true).await;
+    cx.update_global(|store: &mut SettingsStore, cx| {
+        store.update_user_settings(cx, |settings| {
+            settings.vim.get_or_insert_default().use_system_clipboard =
+                Some(UseSystemClipboard::Always);
+        });
+    });
+    cx.set_state("aˇb\n", Mode::Normal);
+    cx.background_executor.set_block_on_ticks(0..=0);
+    let editor = cx.update_editor(|_, _, cx| cx.entity());
+    let completion = cx.update(|window, cx| {
+        editor.update(cx, |editor, cx| {
+            editor.set_soft_wrap_mode(settings::SoftWrap::None, cx);
+            editor.set_text(format!("ab\n{}", "x".repeat(2_000)), window, cx);
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                selections.select_ranges([Point::new(0, 1)..Point::new(0, 1)]);
+            });
+        });
+        window.dispatch_keystroke(Keystroke::parse("j").expect("move keystroke"), cx);
+        editor.update(cx, |editor, cx| {
+            assert!(editor.defer_external_input(|_, _| {}, cx));
+        });
+        cx.write_to_clipboard(ClipboardItem::new_string(String::from("A")));
+        editor
+            .focus_handle(cx)
+            .dispatch_action(&VimPaste::default(), window, cx);
+        cx.write_to_clipboard(ClipboardItem::new_string(String::from("B")));
+        editor.update(cx, |editor, cx| editor.input_completion(cx))
+    });
+    cx.background_executor.set_block_on_ticks(0..=50);
+    completion.await.expect("Vim paste action completed");
+    assert_eq!(cx.buffer_text(), format!("ab\nxxA{}", "x".repeat(1_998)));
+}
+
+#[gpui::test]
+async fn test_deferred_clipboard_raw_yank_then_paste(cx: &mut TestAppContext) {
+    let mut cx = VimTestContext::new(cx, true).await;
+    cx.update_global(|store: &mut SettingsStore, cx| {
+        store.update_user_settings(cx, |settings| {
+            settings.vim.get_or_insert_default().use_system_clipboard =
+                Some(UseSystemClipboard::Always);
+        });
+    });
+    cx.set_state("aˇb\n", Mode::Normal);
+    let line = "x".repeat(2_000);
+    cx.background_executor.set_block_on_ticks(0..=0);
+    let editor = cx.update_editor(|_, _, cx| cx.entity());
+    let completion = cx.update(|window, cx| {
+        editor.update(cx, |editor, cx| {
+            editor.set_soft_wrap_mode(settings::SoftWrap::None, cx);
+            editor.set_text(format!("ab\n{line}\ncd"), window, cx);
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                selections.select_ranges([Point::new(0, 1)..Point::new(0, 1)]);
+            });
+        });
+        for key in ["j", "y", "y"] {
+            window.dispatch_keystroke(Keystroke::parse(key).expect("yank keystroke"), cx);
+        }
+        editor.update(cx, |editor, cx| {
+            assert!(editor.defer_external_input(
+                |_, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(String::from("external")));
+                },
+                cx
+            ));
+        });
+        for text in ["A", "B"] {
+            cx.write_to_clipboard(ClipboardItem::new_string(text.to_owned()));
+            window.dispatch_keystroke(Keystroke::parse("p").expect("paste keystroke"), cx);
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(String::from("C")));
+        editor.update(cx, |editor, cx| editor.input_completion(cx))
+    });
+    cx.background_executor.set_block_on_ticks(0..=50);
+    completion.await.expect("raw yank and paste completed");
+    assert_eq!(cx.buffer_text(), format!("ab\n{line}\n{line}\n{line}\ncd"));
 }
 
 #[gpui::test]
@@ -1886,8 +2130,8 @@ async fn test_mouse_selection(cx: &mut TestAppContext) {
 
     cx.set_state("ˇone two three", Mode::Normal);
 
-    let start_point = cx.pixel_position("one twˇo three");
-    let end_point = cx.pixel_position("one ˇtwo three");
+    let start_point = cx.pixel_position("one twˇo three").await;
+    let end_point = cx.pixel_position("one ˇtwo three").await;
 
     cx.simulate_mouse_down(start_point, MouseButton::Left, Modifiers::none());
     cx.simulate_mouse_move(end_point, MouseButton::Left, Modifiers::none());
@@ -1902,9 +2146,9 @@ async fn test_mouse_drag_across_anchor_does_not_drift(cx: &mut TestAppContext) {
 
     cx.set_state("ˇone two three four", Mode::Normal);
 
-    let click_pos = cx.pixel_position("one ˇtwo three four");
-    let drag_left = cx.pixel_position("ˇone two three four");
-    let anchor_pos = cx.pixel_position("one tˇwo three four");
+    let click_pos = cx.pixel_position("one ˇtwo three four").await;
+    let drag_left = cx.pixel_position("ˇone two three four").await;
+    let anchor_pos = cx.pixel_position("one tˇwo three four").await;
 
     cx.simulate_mouse_down(click_pos, MouseButton::Left, Modifiers::none());
     cx.run_until_parked();
