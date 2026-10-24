@@ -32,6 +32,11 @@ jobs:
         with:
           cache-on-failure: true
 
+      - name: Check
+        run: |
+          cargo check -p settings -p http_client -p reqwest_client -p client \
+            -p extension_host -p auto_update
+
       - name: Build
         run: cargo build -p zed --release
 
