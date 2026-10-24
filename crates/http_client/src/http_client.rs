@@ -519,3 +519,47 @@ impl HttpClient for FakeHttpClient {
         self
     }
 }
+
+static ZED_SERVICES_DISABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether requests to Zed's servers are refused for this process.
+pub fn set_zed_services_disabled(disabled: bool) {
+    ZED_SERVICES_DISABLED.store(disabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn zed_services_disabled() -> bool {
+    ZED_SERVICES_DISABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether the host belongs to Zed Industries rather than to the user.
+pub fn is_zed_service_host(host: &str) -> bool {
+    host == "zed.dev" || host.ends_with(".zed.dev")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_zed_service_host;
+
+    #[test]
+    fn blocks_zed_owned_hosts_only() {
+        for host in [
+            "zed.dev",
+            "api.zed.dev",
+            "cloud.zed.dev",
+            "llm.zed.dev",
+            "staging.zed.dev",
+        ] {
+            assert!(is_zed_service_host(host), "{host} should be blocked");
+        }
+        for host in [
+            "localhost",
+            "127.0.0.1",
+            "api.openai.com",
+            "github.com",
+            "notzed.dev",
+        ] {
+            assert!(!is_zed_service_host(host), "{host} should be allowed");
+        }
+    }
+}

@@ -274,6 +274,17 @@ impl http_client::HttpClient for ReqwestClient {
     > {
         let (parts, body) = req.into_parts();
 
+        if http_client::zed_services_disabled() {
+            if let Some(host) = parts.uri.host() {
+                if http_client::is_zed_service_host(host) {
+                    static LOGGED: std::sync::Once = std::sync::Once::new();
+                    LOGGED
+                        .call_once(|| log::debug!("disable_zed_services: dropped request to {host}"));
+                    return Box::pin(async { Err(anyhow::anyhow!("disabled by disable_zed_services")) });
+                }
+            }
+        }
+
         let mut request_builder = self.client.request(parts.method, parts.uri.to_string());
         request_builder = request_builder.headers(parts.headers);
         if let Some(redirect_policy) = parts.extensions.get::<RedirectPolicy>() {

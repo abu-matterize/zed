@@ -546,10 +546,26 @@ pub struct TelemetrySettings {
 impl settings::Settings for TelemetrySettings {
     fn from_settings(content: &SettingsContent) -> Self {
         let telemetry = content.telemetry.as_ref().unwrap();
+        // Forcing the flags off here stops event queueing, the flush timer, and
+        // crash-report uploads, all of which read these same values.
+        let zed_services_disabled = content.project.disable_zed_services.unwrap_or(false);
         Self {
-            diagnostics: telemetry.diagnostics.unwrap(),
-            metrics: telemetry.metrics.unwrap(),
+            diagnostics: telemetry.diagnostics.unwrap() && !zed_services_disabled,
+            metrics: telemetry.metrics.unwrap() && !zed_services_disabled,
             anthropic_retention: telemetry.anthropic_retention.unwrap(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, RegisterSetting)]
+pub struct ZedServicesSettings {
+    pub disable_zed_services: bool,
+}
+
+impl settings::Settings for ZedServicesSettings {
+    fn from_settings(content: &SettingsContent) -> Self {
+        Self {
+            disable_zed_services: content.project.disable_zed_services.unwrap_or(false),
         }
     }
 }
@@ -1049,6 +1065,10 @@ impl Client {
             return Ok(());
         }
 
+        if http_client::zed_services_disabled() {
+            return Ok(());
+        }
+
         let (is_staff_tx, is_staff_rx) = oneshot::channel::<bool>();
         let mut is_staff_tx = Some(is_staff_tx);
         cx.update(|cx| {
@@ -1093,6 +1113,9 @@ impl Client {
         try_provider: bool,
         cx: &AsyncApp,
     ) -> ConnectionResult<()> {
+        if http_client::zed_services_disabled() {
+            return ConnectionResult::Result(Ok(()));
+        }
         let was_disconnected = match *self.status().borrow() {
             Status::SignedOut | Status::Authenticated => true,
             Status::ConnectionError

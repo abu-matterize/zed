@@ -278,9 +278,10 @@ pub fn init(client: Arc<Client>, cx: &mut App) {
     let auto_updater = cx.new(|cx| {
         let updater = AutoUpdater::new(version, client, cx);
 
-        let poll_for_updates = ReleaseChannel::try_global(cx)
-            .map(|channel| channel.poll_for_updates())
-            .unwrap_or(false);
+        let poll_for_updates = !http_client::zed_services_disabled()
+            && ReleaseChannel::try_global(cx)
+                .map(|channel| channel.poll_for_updates())
+                .unwrap_or(false);
 
         if option_env!("ZED_UPDATE_EXPLANATION").is_none()
             && env::var("ZED_UPDATE_EXPLANATION").is_err()

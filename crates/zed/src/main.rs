@@ -19,7 +19,9 @@ use agent_ui::AgentPanel;
 use anyhow::{Context as _, Result};
 use clap::Parser;
 use cli::FORCE_CLI_MODE_ENV_VAR_NAME;
-use client::{Client, ProxySettings, RefreshLlmTokenListener, UserStore, parse_zed_link};
+use client::{
+    Client, ProxySettings, RefreshLlmTokenListener, UserStore, ZedServicesSettings, parse_zed_link,
+};
 use collab_ui::channel_view::ChannelView;
 use collections::HashMap;
 use crashes::InitCrashHandler;
@@ -495,6 +497,9 @@ fn main() {
             AppCommitSha::set_global(app_commit_sha, cx);
         }
         settings::init(cx);
+        http_client::set_zed_services_disabled(
+            ZedServicesSettings::get_global(cx).disable_zed_services,
+        );
         zlog_settings::init(cx);
         zed::watch_settings_files(fs.clone(), cx);
         handle_keymap_file_changes(user_keymap_file_rx, user_keymap_watcher, cx);
@@ -531,6 +536,9 @@ fn main() {
         let languages = Arc::new(languages);
         let (mut tx, rx) = watch::channel(None);
         cx.observe_global::<SettingsStore>(move |cx| {
+            http_client::set_zed_services_disabled(
+                ZedServicesSettings::get_global(cx).disable_zed_services,
+            );
             let settings = &ProjectSettings::get_global(cx).node;
             let options = NodeBinaryOptions {
                 allow_path_lookup: !settings.ignore_system_version,

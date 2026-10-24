@@ -85,12 +85,18 @@ pub struct ProjectSettingsContent {
     ///
     /// Default: false
     pub disable_ai: Option<SaturatingBool>,
+
+    /// Whether to disable all communication with Zed's servers.
+    ///
+    /// Default: false
+    pub disable_zed_services: Option<bool>,
 }
 
 crate::fallible_options::flattened_deserialize!(ProjectSettingsContent {
     sections: { all_languages, worktree },
     options: {
         terminal, context_server_timeout, load_direnv, git_hosting_providers, disable_ai,
+        disable_zed_services,
     },
     defaults: { lsp, dap, context_servers },
 });

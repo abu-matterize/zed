@@ -1728,6 +1728,10 @@
   //
   // Default: false
   "disable_ai": false,
+  // Whether to disable all communication with Zed's servers.
+  //
+  // Default: false
+  "disable_zed_services": false,
   // Automatically update Zed. This setting may be ignored on Linux if
   // installed through a package manager.
   "auto_update": true,

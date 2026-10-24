@@ -463,6 +463,9 @@ impl ExtensionStore {
 
         cx.spawn(async move |this, cx| {
             initial_index_load.await;
+            if http_client::zed_services_disabled() {
+                return;
+            }
             this.update(cx, |this, cx| this.auto_install_extensions(cx))
                 .ok();
             this.update(cx, |this, cx| this.check_for_updates(cx)).ok();
@@ -816,6 +819,9 @@ impl ExtensionStore {
         query: &[(&str, &str)],
         cx: &mut Context<ExtensionStore>,
     ) -> Task<Result<Vec<ExtensionMetadata>>> {
+        if http_client::zed_services_disabled() {
+            return Task::ready(Ok(Vec::new()));
+        }
         let url = self.http_client.build_zed_api_url(path, query);
         let http_client = self.http_client.clone();
         cx.spawn(async move |_, _| {
